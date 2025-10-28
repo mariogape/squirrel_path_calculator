@@ -265,7 +265,7 @@ def lcp_refined_segmented_along_path(
         return max_nodes_est, windows, pairs
 
     # Find a segment count that satisfies node budget
-    n_segments = 6
+    n_segments = 8
     cap = 128
     max_nodes_est, windows, pairs = estimate_nodes(n_segments)
     while max_nodes_est > max_nodes and n_segments < cap:
