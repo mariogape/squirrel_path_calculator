@@ -22,7 +22,7 @@ from pyproj import CRS, Transformer, Geod
 
 # Defaults
 DEFAULT_COST_RASTER = (
-    Path("data/processed") / "cost_Forest_height_2019_NAFR.tif"
+    Path("data/processed") / "cost_v1_Forest_height_2019_NAFR.tif"
 )
 DEFAULT_OUTPUT_DIR = Path("outputs")
 
@@ -36,6 +36,25 @@ DEFAULT_REFINE_BUFFER_KM = 50.0   # 50 km corridor around coarse path for refine
 DEFAULT_FINE2_FACTOR = 1          # Native resolution for final pass (1=native, 2=half)
 DEFAULT_MAX_NODES = 250_000_000    # Node budget to avoid OOM
 DEFAULT_OUT_FORMAT = "gpkg"
+
+
+# Plug-and-play configuration
+# Set USE_CLI = True to enable command-line arguments; otherwise the script
+# runs with the settings in PP_* variables below for a "plug and play" run.
+USE_CLI = False
+PP_COST_RASTER = DEFAULT_COST_RASTER
+PP_OUTPUT_DIR = DEFAULT_OUTPUT_DIR
+PP_START_POINT = START_POINT
+PP_END_POINT = END_POINT
+PP_FOUR_NEIGH = False            # False => 8-neighbour connectivity
+PP_PLOT = False                  # PNG preview only when also PP_EXTRAS=True
+PP_MAX_NODES = DEFAULT_MAX_NODES
+PP_OUT_FORMAT = DEFAULT_OUT_FORMAT
+PP_EXTRAS = False
+PP_REFINE = True
+PP_COARSE1_FACTOR = DEFAULT_COARSE1_FACTOR
+PP_REFINE_BUFFER_KM = DEFAULT_REFINE_BUFFER_KM
+PP_FINE2_FACTOR = DEFAULT_FINE2_FACTOR
 
 
 class Spinner:
@@ -216,7 +235,7 @@ def lcp_refined_segmented_along_path(
     fine_factor: int,
     max_nodes: int,
     fully_connected: bool,
-) -> Tuple[List[Tuple[float, float]], float]:
+) -> Tuple[List[Tuple[float, float]], float, int, int]:
     """Refined LCP segmentation along the coarse path with a true corridor mask.
 
     Splits the coarse path into segments, builds a geodesic buffer (refine_buffer_km)
@@ -282,6 +301,8 @@ def lcp_refined_segmented_along_path(
     ll2r = Transformer.from_crs(CRS.from_epsg(4326), raster_crs, always_xy=True)
 
     total_cost = 0.0
+    pix0_total = 0
+    pix1_total = 0
     full_coords: List[Tuple[float, float]] = []
 
     for i, ((a, b), w) in enumerate(zip(pairs, windows), start=1):
@@ -298,7 +319,8 @@ def lcp_refined_segmented_along_path(
         else:
             arr, mask, tr = read_cost_surface(src, w)
 
-        # Apply small length penalty to reduce zigzags
+        # Keep raw array for pixel class counting, then adjust for LCP
+        arr_raw = arr.copy()
         arr = adjust_costs(arr)
 
         # Rasterize corridor mask
@@ -342,7 +364,18 @@ def lcp_refined_segmented_along_path(
             seg_coords = seg_coords[1:]
         full_coords.extend(seg_coords)
 
-    return full_coords, total_cost
+        # Count 0/1 pixels along this segment on the raw (unadjusted) array
+        if len(path_rc) > 0:
+            rr = np.array([rc[0] for rc in path_rc], dtype=int)
+            cc = np.array([rc[1] for rc in path_rc], dtype=int)
+            vals = arr_raw[rr, cc]
+            is_finite = np.isfinite(vals)
+            vals = vals[is_finite]
+            # Treat near-0 as forest (0), near-1 as non-forest (1)
+            pix0_total += int(np.isclose(vals, 0.0, atol=1e-6).sum())
+            pix1_total += int(np.isclose(vals, 1.0, atol=1e-6).sum())
+
+    return full_coords, total_cost, pix0_total, pix1_total
 
 
 def index_to_xy(transform_aff: rasterio.Affine, row: int, col: int) -> Tuple[float, float]:
@@ -384,11 +417,12 @@ def write_geojson_line(
     coords_xy: Sequence[Tuple[float, float]],
     crs: CRS,
     out_path: Path,
+    properties: dict | None = None,
 ) -> None:
     line = LineString(coords_xy)
     feature = {
         "type": "Feature",
-        "properties": {},
+        "properties": properties or {},
         "geometry": mapping(line),
     }
     # RFC 7946 prefers WGS84, but we also save in raster CRS for inspection
@@ -406,6 +440,7 @@ def write_vector_line(
     crs: CRS,
     out_path: Path,
     driver: str | None = None,
+    properties: dict | None = None,
 ) -> Path:
     """Write a line to a vector file. Tries Fiona drivers else falls back to GeoJSON.
 
@@ -424,13 +459,27 @@ def write_vector_line(
             driver = "GeoJSON"
 
     if driver == "GeoJSON":
-        write_geojson_line(coords_xy, crs, out_path)
+        write_geojson_line(coords_xy, crs, out_path, properties=properties)
         return out_path
 
     try:
         import fiona  # type: ignore
+        # Infer schema from provided properties; default to just id if absent
+        prop_schema: dict[str, str] = {}
+        if properties:
+            for k, v in properties.items():
+                if isinstance(v, bool):
+                    prop_schema[k] = "int"
+                elif isinstance(v, int):
+                    prop_schema[k] = "int"
+                elif isinstance(v, float):
+                    prop_schema[k] = "float"
+                else:
+                    prop_schema[k] = "str"
+        else:
+            prop_schema = {"id": "int"}
 
-        schema = {"geometry": "LineString", "properties": {"id": "int"}}
+        schema = {"geometry": "LineString", "properties": prop_schema}
         out_path.parent.mkdir(parents=True, exist_ok=True)
         # Prefer crs_wkt for clarity across Fiona versions
         with fiona.open(
@@ -441,14 +490,15 @@ def write_vector_line(
             crs_wkt=crs.to_wkt(),
             layer="lcp" if driver == "GPKG" else None,
         ) as dst:
-            dst.write(
-                {"geometry": mapping(LineString(coords_xy)), "properties": {"id": 1}}
-            )
+            dst.write({
+                "geometry": mapping(LineString(coords_xy)),
+                "properties": properties or {"id": 1},
+            })
         return out_path
     except Exception as e:
         # Fallback to GeoJSON
         alt = out_path.with_suffix(".geojson") if out_path.suffix.lower() != ".geojson" else out_path
-        write_geojson_line(coords_xy, crs, alt)
+        write_geojson_line(coords_xy, crs, alt, properties=properties)
         print(
             f"Vector driver '{driver}' unavailable; wrote GeoJSON instead: {alt} ({e})",
             flush=True,
@@ -508,6 +558,9 @@ def run_lcp(
         arr_plot = None  # type: ignore
         path_plot_rc = None  # type: ignore
 
+        pix0 = 0
+        pix1 = 0
+
         if refine:
             # Stage 1: coarse full-raster run
             cf1 = max(1, int(coarse1_factor))
@@ -560,7 +613,7 @@ def run_lcp(
                     f"Falling back to segmented LCP following coarse path with a {refine_buffer_km:.0f} km corridor.",
                     flush=True,
                 )
-                coords_xy, total_cost = lcp_refined_segmented_along_path(
+                coords_xy, total_cost, pix0, pix1 = lcp_refined_segmented_along_path(
                     src=src,
                     start_xy=start_xy,
                     end_xy=end_xy,
@@ -583,6 +636,8 @@ def run_lcp(
                 else:
                     print("Refine: reading corridor at native resolution...", flush=True)
                     arr2, mask2, tr2 = read_cost_surface(src, window)
+                # Keep raw array for pixel-class counting
+                arr2_raw = arr2.copy()
                 arr2 = adjust_costs(arr2)
                 inside = rasterize(
                     [(corridor_poly, 1)],
@@ -612,6 +667,15 @@ def run_lcp(
                 coords_xy = [index_to_xy(tr2, r, c) for r, c in path_rc]
                 arr_plot = arr2
                 path_plot_rc = path_rc
+                # Count pixels (0/1) traversed on raw (unadjusted) array
+                if len(path_rc) > 0:
+                    rr = np.array([rc[0] for rc in path_rc], dtype=int)
+                    cc = np.array([rc[1] for rc in path_rc], dtype=int)
+                    vals = arr2_raw[rr, cc]
+                    is_finite = np.isfinite(vals)
+                    vals = vals[is_finite]
+                    pix0 = int(np.isclose(vals, 0.0, atol=1e-6).sum())
+                    pix1 = int(np.isclose(vals, 1.0, atol=1e-6).sum())
         else:
             # Compute processing window with buffer
             print(
@@ -666,6 +730,8 @@ def run_lcp(
                 else:
                     print("Reading cost surface at full resolution...", flush=True)
                     arr, mask, out_transform = read_cost_surface(src, window)
+                # Keep raw array for pixel counting then adjust
+                arr_raw = arr.copy()
                 arr = adjust_costs(arr)
 
                 # Compute start/end in window indices (possibly on downsampled grid)
@@ -687,23 +753,18 @@ def run_lcp(
                 coords_xy = [index_to_xy(out_transform, r, c) for r, c in path_rc]
                 arr_plot = arr
                 path_plot_rc = path_rc
-
-        name = "lcp_tarifa_portbou"
-        dst_ext = ".geojson" if out_format.lower() == "geojson" else (".shp" if out_format.lower() == "shp" else ".gpkg")
-
-        # Reproject to WGS84 and save only the primary output unless extras are requested
-        coords_lonlat = reproject_coords(coords_xy, raster_crs, CRS.from_epsg(4326))
-        out_vec_ll = out_dir / f"{name}{dst_ext}"
-        written_ll = write_vector_line(coords_lonlat, CRS.from_epsg(4326), out_vec_ll)
-        print(f"Wrote path: {written_ll}")
-
-        if extras:
-            # Optional: also write raster CRS version
-            out_vec_src = out_dir / f"{name}_raster_crs{dst_ext}"
-            written_src = write_vector_line(coords_xy, raster_crs, out_vec_src)
-            print(f"Wrote path (raster CRS): {written_src}")
+                # Count pixels (0/1) traversed
+                if len(path_rc) > 0:
+                    rr = np.array([rc[0] for rc in path_rc], dtype=int)
+                    cc = np.array([rc[1] for rc in path_rc], dtype=int)
+                    vals = arr_raw[rr, cc]
+                    is_finite = np.isfinite(vals)
+                    vals = vals[is_finite]
+                    pix0 = int(np.isclose(vals, 0.0, atol=1e-6).sum())
+                    pix1 = int(np.isclose(vals, 1.0, atol=1e-6).sum())
 
         # Compute length
+        coords_lonlat = reproject_coords(coords_xy, raster_crs, CRS.from_epsg(4326))
         if raster_crs.is_projected:
             # Euclidean length in projected units (assume meters)
             length_m = 0.0
@@ -714,11 +775,40 @@ def run_lcp(
         else:
             length_m = geodesic_length_wgs84(coords_lonlat)
 
+        # Prepare properties for vector output (length only as requested)
+        properties = {"id": 1, "length_m": float(length_m)}
+
+        name = "lcp"
+        dst_ext = ".geojson" if out_format.lower() == "geojson" else (".shp" if out_format.lower() == "shp" else ".gpkg")
+
+        # Reproject to WGS84 and save only the primary output unless extras are requested
+        out_vec_ll = out_dir / f"{name}{dst_ext}"
+        written_ll = write_vector_line(coords_lonlat, CRS.from_epsg(4326), out_vec_ll, properties=properties)
+        print(f"Wrote path: {written_ll}")
+
+        if extras:
+            # Optional: also write raster CRS version
+            out_vec_src = out_dir / f"{name}_raster_crs{dst_ext}"
+            written_src = write_vector_line(coords_xy, raster_crs, out_vec_src, properties=properties)
+            print(f"Wrote path (raster CRS): {written_src}")
+
         # Always report final total cost
         try:
             print(f"Final total cost: {total_cost:.6f}")
         except Exception:
             pass
+
+        # Report pixel counts and percentages
+        total_pix = pix0 + pix1
+        if total_pix > 0:
+            pct0 = (pix0 / total_pix) * 100.0
+            pct1 = (pix1 / total_pix) * 100.0
+            print(
+                f"Pixels with value 0: {pix0} ({pct0:.1f}%)\n"
+                f"Pixels with value 1: {pix1} ({pct1:.1f}%)"
+            )
+        else:
+            pct0 = pct1 = 0.0
 
         # Optional summary only when extras=True
         if extras:
@@ -731,6 +821,10 @@ def run_lcp(
                         "pixels_in_path": len(coords_xy),
                         "total_cost": total_cost,
                         "approx_length_m": length_m,
+                        "pix0": pix0,
+                        "pix1": pix1,
+                        "pix0_pct": pct0,
+                        "pix1_pct": pct1,
                         "raster": str(cost_raster),
                         "window": {
                             "col_off": int(window.col_off),
@@ -872,33 +966,56 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    parser = build_arg_parser()
-    args = parser.parse_args()
+    use_cli = USE_CLI or str(os.environ.get("LCP_USE_CLI", "")).lower() in ("1", "true", "yes")
+    if use_cli:
+        parser = build_arg_parser()
+        args = parser.parse_args()
 
-    cost_raster = Path(args.cost_raster)
-    if not cost_raster.exists():
-        raise FileNotFoundError(f"Cost raster not found: {cost_raster}")
+        cost_raster = Path(args.cost_raster)
+        if not cost_raster.exists():
+            raise FileNotFoundError(f"Cost raster not found: {cost_raster}")
 
-    out_dir = Path(args.output_dir)
+        out_dir = Path(args.output_dir)
 
-    start = (float(args.start[0]), float(args.start[1]))
-    end = (float(args.end[0]), float(args.end[1]))
+        start = (float(args.start[0]), float(args.start[1]))
+        end = (float(args.end[0]), float(args.end[1]))
 
-    run_lcp(
-        cost_raster=cost_raster,
-        start_lonlat=start,
-        end_lonlat=end,
-        out_dir=out_dir,
-        fully_connected=not args.four_neigh,
-        plot_png=args.plot,
-        max_nodes=args.max_nodes,
-        out_format=args.out_format,
-        extras=args.extras,
-        refine=args.refine,
-        coarse1_factor=args.coarse1_factor,
-        refine_buffer_km=float(args.refine_buffer_km),
-        fine2_factor=int(args.fine2_factor),
-    )
+        run_lcp(
+            cost_raster=cost_raster,
+            start_lonlat=start,
+            end_lonlat=end,
+            out_dir=out_dir,
+            fully_connected=not args.four_neigh,
+            plot_png=args.plot,
+            max_nodes=args.max_nodes,
+            out_format=args.out_format,
+            extras=args.extras,
+            refine=args.refine,
+            coarse1_factor=args.coarse1_factor,
+            refine_buffer_km=float(args.refine_buffer_km),
+            fine2_factor=int(args.fine2_factor),
+        )
+    else:
+        cost_raster = Path(PP_COST_RASTER)
+        if not cost_raster.exists():
+            raise FileNotFoundError(f"Cost raster not found: {cost_raster}")
+        out_dir = Path(PP_OUTPUT_DIR)
+
+        run_lcp(
+            cost_raster=cost_raster,
+            start_lonlat=PP_START_POINT,
+            end_lonlat=PP_END_POINT,
+            out_dir=out_dir,
+            fully_connected=not PP_FOUR_NEIGH,
+            plot_png=PP_PLOT,
+            max_nodes=PP_MAX_NODES,
+            out_format=PP_OUT_FORMAT,
+            extras=PP_EXTRAS,
+            refine=PP_REFINE,
+            coarse1_factor=PP_COARSE1_FACTOR,
+            refine_buffer_km=float(PP_REFINE_BUFFER_KM),
+            fine2_factor=int(PP_FINE2_FACTOR),
+        )
 
 
 if __name__ == "__main__":

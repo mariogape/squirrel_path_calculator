@@ -1,6 +1,7 @@
 import argparse
 import os
 from pathlib import Path
+from datetime import datetime
 
 import numpy as np
 import rasterio
@@ -12,10 +13,25 @@ DEFAULT_INPUT_PATH = Path("data/raw/Forest_height_2019_NAFR.tif")
 DEFAULT_OUTPUT_DIR = Path("data/processed")
 
 
+# Plug-and-play config (no CLI needed)
+# Set USE_CLI=True to enable command-line arguments instead.
+USE_CLI = False
+PP_INPUT_PATH = DEFAULT_INPUT_PATH
+PP_OUTPUT_DIR = DEFAULT_OUTPUT_DIR
+PP_THRESHOLD_M = 5  # Change here (e.g., 10) for forest threshold in meters
+PP_MASK_NODATA = False
+PP_OUTPUT_NODATA = 255
+PP_COMPRESS = "LZW"
+PP_USE_FULL_EXTENT = False  # False => default Iberia crop; True => full raster extent
+PP_BOUNDS = None            # Or tuple (minx, miny, maxx, maxy) in PP_BOUNDS_CRS
+PP_BOUNDS_CRS = "EPSG:4326"
+PP_SHOW_PROGRESS = True
+
+
 def reclassify_to_cost(
     input_raster: str,
     output_raster: str,
-    threshold_m: int = 3,
+    threshold_m: int = 10,
     mask_no_data: bool = False,
     output_nodata_value: int = 255,
     compress: str = "LZW",
@@ -131,7 +147,22 @@ def reclassify_to_cost(
                     use_tqdm = False
             printed_pct = -1
 
-            with rasterio.open(output_path, "w", **profile) as dst:
+            # Handle existing/locked output files on Windows by falling back to an alternate path
+            write_path = output_path
+            if write_path.exists():
+                try:
+                    os.remove(write_path)
+                except Exception:
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    write_path = write_path.with_name(
+                        f"{write_path.stem}__new_{ts}{write_path.suffix}"
+                    )
+                    if show_progress:
+                        print(
+                            f"Existing output locked; writing to alternate path: {write_path}"
+                        )
+
+            with rasterio.open(write_path, "w", **profile) as dst:
                 # Iterate over tiles within the crop window
                 src_row0 = int(crop_window.row_off)
                 src_col0 = int(crop_window.col_off)
@@ -181,6 +212,9 @@ def reclassify_to_cost(
 
             if use_tqdm and pbar is not None:
                 pbar.close()
+
+    # Return actual path written (could be alternate if original was locked)
+    return str(write_path)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -255,31 +289,50 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main():
-    parser = build_arg_parser()
-    args = parser.parse_args()
+    if USE_CLI:
+        parser = build_arg_parser()
+        args = parser.parse_args()
 
-    # Resolve input path: CLI value or default constant
-    input_path = args.input if args.input else str(DEFAULT_INPUT_PATH)
-    if args.output:
-        output_path = args.output
+        # Resolve input path: CLI value or default constant
+        input_path = args.input if args.input else str(DEFAULT_INPUT_PATH)
+        if args.output:
+            output_path = args.output
+        else:
+            in_name = Path(input_path).stem
+            output_path = str(DEFAULT_OUTPUT_DIR / f"cost_v1_{in_name}.tif")
+
+        out_path = reclassify_to_cost(
+            input_raster=input_path,
+            output_raster=output_path,
+            threshold_m=args.threshold,
+            mask_no_data=args.mask_nodata,
+            output_nodata_value=args.output_nodata,
+            compress=args.compress,
+            bounds=tuple(args.bounds) if args.bounds is not None else None,
+            bounds_crs=args.bounds_crs,
+            use_full_extent=args.full,
+            show_progress=not args.no_progress,
+        )
     else:
+        # Plug-and-play path (no CLI): edit PP_* variables near the top
+        input_path = str(PP_INPUT_PATH)
         in_name = Path(input_path).stem
-        output_path = str(DEFAULT_OUTPUT_DIR / f"cost_{in_name}.tif")
+        output_path = str(PP_OUTPUT_DIR / f"cost_v1_{in_name}.tif")
 
-    reclassify_to_cost(
-        input_raster=input_path,
-        output_raster=output_path,
-        threshold_m=args.threshold,
-        mask_no_data=args.mask_nodata,
-        output_nodata_value=args.output_nodata,
-        compress=args.compress,
-        bounds=tuple(args.bounds) if args.bounds is not None else None,
-        bounds_crs=args.bounds_crs,
-        use_full_extent=args.full,
-        show_progress=not args.no_progress,
-    )
+        out_path = reclassify_to_cost(
+            input_raster=input_path,
+            output_raster=output_path,
+            threshold_m=PP_THRESHOLD_M,
+            mask_no_data=PP_MASK_NODATA,
+            output_nodata_value=PP_OUTPUT_NODATA,
+            compress=PP_COMPRESS,
+            bounds=None if PP_BOUNDS is None else tuple(PP_BOUNDS),
+            bounds_crs=PP_BOUNDS_CRS,
+            use_full_extent=PP_USE_FULL_EXTENT,
+            show_progress=PP_SHOW_PROGRESS,
+        )
 
-    print(f"Wrote cost raster: {output_path}")
+    print(f"Wrote cost raster: {out_path}")
 
 
 if __name__ == "__main__":

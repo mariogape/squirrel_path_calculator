@@ -103,3 +103,13 @@ python scripts/least_cost_path.py \
 - Missing a detour: increase `DEFAULT_REFINE_BUFFER_KM` and/or `DEFAULT_MAX_NODES`.
 - Many segments (e.g., 256): native corridor is huge; raise `--max-nodes` or try `--fine2-factor 2`.
 - Slow installs: prefer prebuilt wheels for `rasterio`/`shapely` on Windows/macOS.
+
+## Reclassify: Plug-and-Play Mode
+- No arguments needed: set `USE_CLI = False` at `scripts/reclassify_forest_cost.py:18`.
+- Edit `PP_THRESHOLD_M` at `scripts/reclassify_forest_cost.py:21` (e.g., 3 or 10) to control the forest threshold.
+- Optional in-file settings: `PP_USE_FULL_EXTENT`, `PP_MASK_NODATA`, `PP_BOUNDS`, `PP_BOUNDS_CRS`, `PP_SHOW_PROGRESS`.
+- Run: `python scripts/reclassify_forest_cost.py`. Output defaults to `data/processed/cost_v1_Forest_height_2019_NAFR.tif`.
+
+## Reclassify: Windows Locked Output
+- If the default output file is open in another app, the script writes to a timestamped alternate path like `.../cost_v1_Forest_height_2019_NAFR__new_YYYYmmdd_HHMMSS.tif`.
+- Close apps using the file (e.g., QGIS, Explorer preview) to overwrite the default filename, or delete/rename the existing file before rerunning.
