@@ -27,8 +27,8 @@ DEFAULT_COST_RASTER = (
 DEFAULT_OUTPUT_DIR = Path("outputs")
 
 # Approx coordinates (lon, lat) in WGS84
-START_POINT = (-5.6060, 36.0130)
-END_POINT = (-1.752427, 43.335370)
+START_POINT = (-9.2903477, 42.9249495)
+END_POINT = (3.319543, 42.319376)
 
 # Tunable defaults (easy to find)
 DEFAULT_COARSE1_FACTOR = 4       # x4 downsampling for the coarse global pass
@@ -778,7 +778,7 @@ def run_lcp(
         # Prepare properties for vector output (length only as requested)
         properties = {"id": 1, "length_m": float(length_m)}
 
-        name = "lcp"
+        name = "lcp_test"
         dst_ext = ".geojson" if out_format.lower() == "geojson" else (".shp" if out_format.lower() == "shp" else ".gpkg")
 
         # Reproject to WGS84 and save only the primary output unless extras are requested
